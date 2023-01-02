@@ -1,0 +1,367 @@
+//  EA076 - Projeto 1
+
+/* COMANDOS VÁLIDOS (enviados pelo terminal serial):
+  VEL xxx*    ajuste de velocidade (xxx entre 000 e 100)
+  VENT*       função ventilador
+  EXAUST*     função exaustor
+  PARA*       parar
+  RETVEL*     retorna estimativa da velocidade do motor em rpm
+
+  Através do terminal serial, o programa recebe os comandos, que devem terminar com um asterisco.
+  Quando chega um asterisco, ativa-se a flag de decodificação do comando.
+  Assim, o comando é decodificado e executado.
+
+  A cada intervalo de 400 ms, é estimada a frequência de rotação do motor.
+  A cada intervalo de 16 ms, os displays de 7 segmentos são atualizados.
+*/
+
+#include <LiquidCrystal.h>
+#include <Wire.h>
+
+LiquidCrystal lcd (11, 10, 9, 7, 6, 5); // RS, E, DB4-DB7 
+
+// Define constantes do encoder
+#define N 2
+#define intervalo 400 //a cada intervalo T (mili-segundos), é calculada a frequência
+#define encoder_int_pin 8 //sinal que dispara interrupcao do encoder
+
+// Define constante do display de 7seg
+#define intervalo_display 4 //a cada intervalo (ms), é atualizado o valor de 1 digito no display de 7seg
+
+
+// Define pinos da ponte H
+#define H1A 2     // HxA entrada da ponte H para controle de sentido
+#define H2A 4     
+#define Henable 3 // Output PWM para controle de velocidade do motor
+
+// Constantes de sentido para o motor
+const int vent =  1;
+const int exaust = -1;
+const int parado = 0;
+
+// Strings serial
+String comandoString = ""; //guarda o comando recebido pela serial
+String msg = ""; //guarda a mensagem a ser printada apos envio do comando
+
+// Variáveis de comando
+String vel = ""; //guarda o valor recebido atraves do comando VEL xxx*
+unsigned int valorVel = 0; //valor recebido em vel, porem no tipo inteiro (p/possibilitar comparacoes/calculos)
+
+// Variáveis de cálculo da frequência
+float contador_pulsos = 0; // guarda o número de pulsos do encoder
+float nb = 0;              // guarda valor de número de pulsos quando se atinge o intervalo p/calculo da freq
+float f = 0;               // guarda o valor da frequência calculada
+float contador_timer0 = 0; // incrementa a cada 2 mili-segundos, é usado p/cálculo da freq do motor
+
+// Variáveis para atualização do display de 7seg
+float cnt_timer0 = 0; //incrementa a cada 2 ms, é usado p/atualização do display de 7seg
+unsigned char pcfA = 0; //valor do LSB a ser passado para pcf8574
+unsigned char pcfB = 0;
+unsigned char pcfC = 0;
+unsigned char pcfD = 0; //valor do MSB a ser passado para pcf8574
+/*  P7  P6  P5  P4  P3  P2  P1  P0
+ *  D   C   B   A   D4  D3  D2  D1
+ */
+
+// Flags de controle
+bool decodifica = false; //flag que é ativada quando chega "*" no serial
+bool calcula_freq = false; //flag que é ativada quando se atinge o intervalo T e deve-se calcular a freq
+int flag_sentido = parado; //flag que armazena o sentido do último comando de direção do ventilador
+bool atualiza_display = false; //flag que é ativada quando deve-se atualizar o display de 7seg
+int digito = 0; //flag que armazena a posição do dígito que deve ser atualizado no display de 7seg
+
+//configura o temporizador
+void configuracao_Timer0(){
+  // Configuracao Temporizador 0 (8 bits) para gerar interrupcoes periodicas
+  // a cada 2ms no modo Clear Timer on Compare Match (CTC)
+  // Relogio = 16e6 Hz
+  // Prescaler = 1024
+  // Faixa = 125 (contagem de 0 a OCR0A = 124)
+  // Intervalo entre interrupcoes: (Prescaler/Relogio)*Faixa = (256/16e6)*(124+1) = 0.002s
+  
+  // TCCR0A – Timer/Counter Control Register A
+  // COM0A1 COM0A0 COM0B1 COM0B0 – – WGM01 WGM00
+  // 0      0      0      0          1     0
+  TCCR0A = 0x02;
+
+  // OCR0A – Output Compare Register A
+  OCR0A = 124;
+
+  // TIMSK0 – Timer/Counter Interrupt Mask Register
+  // – – – – – OCIE0B OCIE0A TOIE0
+  // – – – – – 0      1      0
+  TIMSK0 = 0x02;
+  
+  // TCCR0B – Timer/Counter Control Register B
+  // FOC0A FOC0B – – WGM02 CS02 CS01 CS0
+  // 0     0         0     1    0    0
+  TCCR0B = 0x04;
+}
+
+//configura o pino que recebe sinal do encoder
+void configuracao_pinchange() {
+  //  PCICR - Pin Change Interrupt Control Register
+  //  - - - - -  PCIE2 PCIE1 PCIE0
+  //  - - - - -   0     0      1
+  //  enable pin change interrupt 0 (ativa PCINT[7:0], no diagrama são os pinos [13:8])
+  PCICR = 0x01;
+
+  PCMSK0 = 0x01;
+  //  pino 8 do arduino vai receber o sinal do encoder
+}
+
+//  Rotina de servico de interrupcao do temporizador
+ISR(TIMER0_COMPA_vect) {
+  contador_timer0++; //a cada 2ms, o contador é incrementado (utilizado p/calculo da freq)
+  cnt_timer0++; //a cada 2ms, o contador é incrementado (utilizado p/atualizacao do display de 7seg)
+  
+  if (contador_timer0 >= intervalo/2) { //contador atinge o valor definido p/calculo da freq
+    nb = contador_pulsos; //guarda número de pulsos que ocorreram dentro do intervalo
+    calcula_freq = true; //flag p/realizar o cálculo da frequência
+  }
+  
+  if (cnt_timer0 >= intervalo_display/2) { //contador atinge o valor definido p/atualizar display de 7seg
+    atualiza_display = true;
+  }
+}
+
+//  Rotina de servico de interrupcao do pin change
+ISR(PCINT0_vect) {
+  contador_pulsos++; //incrementado a cada vez que há impulso no encoder
+}
+
+
+void display_lcd(int status_motor, int duty_cycle) {
+  
+  lcd.setCursor(0, 0); //coluna 0, linha 0
+  if (status_motor == parado) {
+    lcd.print("PARADO    ");
+  }
+  else if (status_motor == vent) {
+    lcd.print("VENTILACAO");
+  }
+  else if (status_motor == exaust) {
+    lcd.print("EXAUSTAO  ");
+  }
+
+  String mensagem = "DC: "; mensagem.concat(String(duty_cycle)); mensagem.concat("%  ");
+  lcd.setCursor(0, 1); //coluna 0, linha 1
+  lcd.print(mensagem);
+}
+
+void estimaFreq() {
+  float T;
+  T = contador_timer0*2; //tempo em mili-segundos
+  f = 30000*nb/N/T; //frequência em rpm
+  //reseta variáveis
+  contador_timer0 = 0;
+  contador_pulsos = 0;
+}
+
+// Decodifica e responde a mensagem lida
+void decodificaComando() {
+  // Caso VEL
+  if(comandoString.startsWith("vel ")){
+    vel = comandoString.substring(4,7);
+    if(comandoString.length() == 4){ // comandoString = 'vel '
+      Serial.println("ERRO: PARAMETRO AUSENTE");
+    }
+    else if(comandoString.length() < 7 || isDigit(vel[0]) == 0 || isDigit(vel[1]) == 0 || isDigit(vel[2]) == 0){
+      Serial.println("ERRO: PARAMETRO INCORRETO");
+    }
+    else { // Parâmetro OK com 3 dígitos
+      valorVel = vel.toInt();
+      if(valorVel < 0 || valorVel > 100){
+        Serial.println("ERRO: PARAMETRO INCORRETO");
+      } 
+      else {
+        if(flag_sentido != parado){
+          analogWrite(Henable, 2.55*valorVel);
+        }
+        msg = "OK VEL "; msg.concat(vel); msg.concat("%");
+        Serial.println(msg);
+        display_lcd(flag_sentido, valorVel);
+      }
+    }
+    // Reinicializa as variáveis e retorna
+    decodifica = false;
+    comandoString = ""; 
+  }
+  // Outros casos
+  else if(comandoString.startsWith("vent") && comandoString.length() == 4){
+    if (flag_sentido == vent){ // Redundância de comando
+      Serial.println("OK VENT");
+      decodifica = false;
+      comandoString = "";
+    }
+    else if(f != 0){ //se o motor nao está parado, é necessário parar antes de inverter sentido
+      analogWrite(Henable, parado);
+    }
+    else { // Executa comando vent
+      digitalWrite(H1A, HIGH);
+      digitalWrite(H2A, LOW);
+      analogWrite(Henable, 2.55*valorVel);
+      Serial.println("OK VENT");
+      decodifica = false;
+      comandoString = "";
+      flag_sentido = vent;
+      display_lcd(vent, valorVel);
+    }
+  } 
+  else if(comandoString.startsWith("exaust") && comandoString.length() == 6){
+    if (flag_sentido == exaust){ // Redundância de comando
+      Serial.println("OK EXAUST");
+      decodifica = false;
+      comandoString = "";
+    }
+    else if(f != 0){ //se o motor nao está parado, é necessário parar antes de inverter sentido
+      analogWrite(Henable, parado);
+    }
+    else { // Executa comando exaust
+      digitalWrite(H1A, LOW);
+      digitalWrite(H2A, HIGH);
+      analogWrite(Henable, 2.55*valorVel);
+      Serial.println("OK EXAUST");
+      decodifica = false;
+      comandoString = "";
+      flag_sentido = exaust;
+      display_lcd(exaust, valorVel);
+    }
+  } 
+  else if(comandoString.startsWith("para") && comandoString.length() == 4){
+    analogWrite(Henable, parado);
+    Serial.println("OK PARA");
+    decodifica = false;
+    comandoString = "";
+    flag_sentido = parado;
+    display_lcd(parado, valorVel);
+  } 
+  else if(comandoString.startsWith("retvel") && comandoString.length() == 6){
+    msg = "VEL "; msg.concat(String(f)); msg.concat(" RPM");
+    Serial.println(msg);
+    decodifica = false;
+    comandoString = "";
+  }
+  else { 
+    Serial.println("ERRO: COMANDO INEXISTENTE");
+    decodifica = false;
+    comandoString = "";
+  }
+  return;
+}
+
+// Função que lê um caractere por chamada
+void leCaractereSerial() {
+  char comandoChar = tolower(Serial.read()); // Tira Case sensitive
+  if (comandoChar == '*')
+    decodifica = true;
+  else if (comandoChar != '\n'){ // Evitar que caracteres Enter entrem no comando
+    if (comandoString.length() < 7){ // Limita ao tamanho máximo dos comando
+      comandoString += comandoChar;
+    }  
+  }
+}
+
+//separa cada dígito do valor da velocidade em rpm para enviar ao display de 7seg correto
+void digitos_7seg() {
+  int freq;
+  int freqA, freqB, freqC, freqD; //LSB:MSB
+  freq = int(f); //float -> int TRUNCA o valor
+  freqD = freq/1000; //captura MSB
+  freqC = (freq%1000)/100;
+  freqB = (freq%100)/10;
+  freqA = (freq%10); //captura LSB
+  
+  pcfD = freqD; //passa o valor para variável de 8 bits
+  pcfD = pcfD << 4; //desloca para os bits mais significativos (P7:P4), que é onde se armazena o valor do dígito
+  pcfD = pcfD | 0x0E; //seleciona o catodo do dígito mais significativo
+  
+  pcfC = freqC;
+  pcfC = pcfC << 4;
+  pcfC = pcfC | 0x0D; //seleciona o catodo do segundo dígito mais significativo
+  
+  pcfB = freqB;
+  pcfB = pcfB << 4;
+  pcfB = pcfB | 0x0B; //seleciona o catodo do terceiro dígito mais significativo
+  
+  pcfA = freqA;
+  pcfA = pcfA << 4;
+  pcfA = pcfA | 0x07; //seleciona o catodo do LSB
+}
+
+//seleciona qual display deve ser atualizado e envia o valor
+void seleciona_envia_digito(int digito) {
+  cnt_timer0 = 0;
+  if (digito==0) { //LSB
+    Wire.beginTransmission(0x20);
+    Wire.write(pcfA);
+    Wire.endTransmission(0x20);
+  }
+  else if (digito==1) {
+    Wire.beginTransmission(0x20);
+    Wire.write(pcfB);
+    Wire.endTransmission(0x20);
+  }
+  else if (digito==2) {
+    Wire.beginTransmission(0x20);
+    Wire.write(pcfC);
+    Wire.endTransmission(0x20);
+  }
+  else if (digito==3) { //MSB
+    Wire.beginTransmission(0x20);
+    Wire.write(pcfD);
+    Wire.endTransmission(0x20);
+  }
+}
+
+void setup() {
+  // Inicializa serial
+  Serial.begin(9600);
+  // Inicializa I2C
+  Wire.begin(); 
+  
+  // Inicializa LCD
+  lcd.begin(16,2);
+  lcd.setCursor(0, 0); //coluna 0, linha 0
+  lcd.print("PARADO");
+  lcd.setCursor(0, 1); //coluna 0, linha 1  
+  lcd.print("DC: 0%");
+  
+  // Modo do pino de interrupção do encoder
+  pinMode(encoder_int_pin, INPUT); //pino que recebe o sinal do encoder em configuracao_pinchange()
+  
+  // Modos dos pinos da ponte H
+  pinMode(H1A, OUTPUT);
+  pinMode(H2A, OUTPUT);
+  pinMode(Henable, OUTPUT);
+  
+  // Configura as interrupções
+  cli();  //desabilita interrupcoes
+  configuracao_Timer0();  //configura o temporizador
+  configuracao_pinchange();
+  sei();  //habilita interrupções
+}
+
+void loop() {
+  //_delay_ms(1);
+  if (Serial.available() > 0){
+    leCaractereSerial();
+  }
+  if (decodifica){
+    decodificaComando();
+  }
+  
+  if (calcula_freq) { //flag: intervalo atingido -> calculo da freq
+    estimaFreq();
+    calcula_freq = false;
+    digitos_7seg(); //atualiza valores de cada digito do display de 7 seg
+  }
+  
+  if (atualiza_display) { //flag: intervalo atingido -> atualizacao do display de 7seg
+    atualiza_display=false;
+    seleciona_envia_digito(digito);
+    digito++;
+    if(digito>=4)
+      digito=0;
+  }
+}
