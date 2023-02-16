@@ -1,2 +1,2 @@
 # ea076
-projetos da disciplina de sistemas embarcados
+projetos da disciplina de sistemas embarcados (arduino)
