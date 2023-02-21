@@ -1,0 +1,692 @@
+#include <Wire.h>
+#include <LiquidCrystal.h>
+
+LiquidCrystal lcd (11, 10, 9, 7, 6, 5); // RS, E, DB4-DB7 
+
+#define intervalo_debounce 50 //milisegundos para debounce do click do teclado
+#define intervalo_coleta_temp 200 //a cada intervalo (ms), é coletado o valor da temperatura 
+#define intervalo_display 4 //a cada intervalo (ms), é atualizado o valor de 1 digito no display de 7seg
+
+//pinos do arduino conectados ao teclado matricial
+#define col1 8    //coluna 1 -> pino 8   (input)
+#define col2 12   //coluna 2 -> pino 12  (input)
+#define col3 13   //coluna 3 -> pino 13  (input)
+#define lin1 A0   //linha 1 ->  pino A0  (output)
+#define lin2 2    //linha 2 ->  pino 2   (output)
+#define lin3 3    //linha 3 ->  pino 3   (output)
+#define lin4 4    //linha 4 ->  pino 4   (output)
+#define LM35 A1   //pino de leitura do sensor de temperatura
+
+// Variáveis para atualização do display de 7seg
+volatile bool att_temp = true; //flag que é ativada quando são coletadas 10 amostras de temperatura (e deve-se calcular a média)
+volatile float disp_timer0 = 0; //contador que incrementa a cada 2 ms, é usado p/atualização do display de 7seg
+unsigned char pcfA = 0; //valor do LSB a ser passado para pcf8574
+unsigned char pcfB = 0;
+unsigned char pcfC = 0;
+unsigned char pcfD = 0; //valor do MSB a ser passado para pcf8574
+/*  P7  P6  P5  P4  P3  P2  P1  P0
+ *  D   C   B   A   D4  D3  D2  D1
+ */
+volatile bool atualiza_display = false; //flag que é ativada quando deve-se atualizar o display de 7seg
+int digito = 0; //flag que armazena a posição do dígito que deve ser atualizado no display de 7seg
+
+// Variáveis da EEPROM
+unsigned char valor; //guarda o byte retornado pela função "ler"
+unsigned int address = 0; //endereço da memória
+unsigned int prox_endereco; //guarda valor do próximo endereço a ser utilizado
+unsigned int n_dados_armazenados; //guarda a quantidade de dados armazenados
+
+//flags do teclado matricial
+bool flag_deb = false; //quando true, habilita o contador do debounce
+bool botao_pressionado = false; //é true quando é validado que o botão foi pressionado
+bool botao_solto = false; //é true quando é validado que o botão foi solto
+
+//variáveis do display lcd
+int a = 0; //posicao do caracter no display lcd
+unsigned int acao; //armazena a ação que deve ser tomada
+String printa; //guarda caracter a ser impresso no lcd
+String acao_botao; //armazena o botão que foi pressionado (vinculado à sua respectiva ação)
+String qtd = ""; //armazena quantidade de dados a ser transferida (comando 5)
+
+//variáveis para o cálculo da temperatura
+float temperatura = 666.6; //guarda a soma dos valores coletados (até atingir 10 coletas). Inicializado com 9999 como feature.
+volatile int contador_coleta_temp = 0; //incrementa a cada 2 ms, é usado p/checar intervalo das coletas de temperatura
+volatile bool coleta_temp = false; //flag que é ativada quando se atinge o intervalo p/uma nova coleta de temperatura
+int contador_temperaturas = 1; //contador p/quantidade de temperaturas coletadas 
+float media_temp = 0; //armazena média das temperaturas coletadas
+int temp; //variável do tipo int p/truncar o valor da temperatura a ser mostrado no display de 7seg
+unsigned int dados_disponiveis = 0; //armazena valor do espaço disponível p/dados
+
+//Variáveis da MEF do lcd
+int estado_displayLCD = 0; //armazena o estado atual da MEF que utiliza o lcd
+bool start_coleta = false; //flag p/iniciar a coleta da temperatura
+
+//variáveis da MEF do teclado matricial
+volatile float cnt_timer_deb = 0; //contador p/ intervalo do debounce
+int estado_teclado = 1; //4 estado_teclados principais: 1, 2, 3, 4 (cada um corresponde a uma linha)
+int linha = 1;
+int posicao = 0;  //guarda a posicao do botao pressionado (durante varredura)
+int posicao_deb = 0; //guarda a posicao do botao pressionado para comparar com o valor da variável "posicao" após intervalo_debounce
+/*  0 -> nenhum botao pressionado
+  *  1 ->  linha 1, coluna 1
+  *  2 ->  linha 1, coluna 2
+  *  3 ->  linha 1, coluna 3
+  *  4 ->  linha 2, coluna 1
+  *  5 ->  linha 2, coluna 2
+  *  6 ->  linha 2, coluna 3
+  *  7 ->  linha 3, coluna 1
+  *  8 ->  linha 3, coluna 2
+  *  9 ->  linha 3, coluna 3
+  *  10 -> linha 4, coluna 1
+  *  11 -> linha 4, coluna 2
+  *  12 -> linha 4, coluna 3
+  */
+
+//configura o temporizador
+void configuracao_Timer0(){
+  // Configuracao Temporizador 0 (8 bits) para gerar interrupcoes periodicas
+  // a cada 2ms no modo Clear Timer on Compare Match (CTC)
+  // Relogio = 16e6 Hz
+  // Prescaler = 1024
+  // Faixa = 125 (contagem de 0 a OCR0A = 124)
+  // Intervalo entre interrupcoes: (Prescaler/Relogio)*Faixa = (256/16e6)*(124+1) = 0.002s
+  
+  // TCCR0A – Timer/Counter Control Register A
+  // COM0A1 COM0A0 COM0B1 COM0B0 – – WGM01 WGM00
+  // 0      0      0      0          1     0
+  TCCR0A = 0x02;
+
+  // OCR0A – Output Compare Register A
+  OCR0A = 124;
+
+  // TIMSK0 – Timer/Counter Interrupt Mask Register
+  // – – – – – OCIE0B OCIE0A TOIE0
+  // – – – – – 0      1      0
+  TIMSK0 = 0x02;
+  
+  // TCCR0B – Timer/Counter Control Register B
+  // FOC0A FOC0B – – WGM02 CS02 CS01 CS0
+  // 0     0         0     1    0    0
+  TCCR0B = 0x04;
+}
+
+ISR(TIMER0_COMPA_vect) {
+  disp_timer0++; //a cada 2ms, o contador é incrementado (utilizado p/atualizacao dos dígitos display de 7seg)
+  contador_coleta_temp++; //utilizado p/coleta da temperatura
+
+  if (flag_deb){ //é necessário ativar o contador do debounce
+    cnt_timer_deb++;
+  }
+
+  if (contador_coleta_temp >= intervalo_coleta_temp/2){ //contador atinge o valor definido p/coletar temperatura
+    coleta_temp = true;
+  }
+
+  if (disp_timer0 >= intervalo_display/2){ //contador atinge o valor definido p/atualizar display de 7seg
+    atualiza_display = true;
+  }
+}
+
+//seleciona qual display deve ser atualizado e envia o valor
+void seleciona_envia_digito(int digito) {
+  atualiza_display = false;
+  disp_timer0 = 0;
+  if (digito==0) { //LSB
+    Wire.beginTransmission(0x20);
+    Wire.write(pcfA);
+    Wire.endTransmission(0x20);
+  }
+  else if (digito==1) {
+    Wire.beginTransmission(0x20);
+    Wire.write(pcfB);
+    Wire.endTransmission(0x20);
+  }
+  else if (digito==2) {
+    Wire.beginTransmission(0x20);
+    Wire.write(pcfC);
+    Wire.endTransmission(0x20);
+  }
+  else if (digito==3) { //MSB
+    Wire.beginTransmission(0x20);
+    Wire.write(pcfD);
+    Wire.endTransmission(0x20);
+  }
+}
+
+//separa cada dígito do valor da velocidade em rpm para enviar ao display de 7seg correto
+void digitos_7seg() {
+  
+  att_temp = false;
+  media_temp = temperatura/contador_temperaturas;
+  contador_temperaturas = 0;
+  temperatura = 0;
+  int freqA, freqB, freqC, freqD; //LSB:MSB
+  temp = int(media_temp*10); //float -> int TRUNCA o valor; é multiplicado por 10 p/nao perder o valor após a vírgula
+  freqD = temp/1000; //captura MSB
+  freqC = (temp%1000)/100;
+  freqB = (temp%100)/10;
+  freqA = (temp%10); //captura LSB
+  
+  pcfD = freqD; //passa o valor para variável de 8 bits
+  pcfD = pcfD << 4; //desloca para os bits mais significativos (P7:P4), que é onde se armazena o valor do dígito
+  pcfD = pcfD | 0x0E; //seleciona o catodo do dígito mais significativo
+  
+  pcfC = freqC;
+  pcfC = pcfC << 4;
+  pcfC = pcfC | 0x0D; //seleciona o catodo do segundo dígito mais significativo
+  
+  pcfB = freqB;
+  pcfB = pcfB << 4;
+  pcfB = pcfB | 0x0B; //seleciona o catodo do terceiro dígito mais significativo
+  
+  pcfA = freqA;
+  pcfA = pcfA << 4;
+  pcfA = pcfA | 0x07; //seleciona o catodo do LSB
+}
+
+void escrever(unsigned int add, unsigned char dado){
+  /* 
+  * O endereco completo tem 15 bits: 1010 aaa aaaa aaaa,
+  * sendo "aaa aaaa aaaa" o argumento passado em add,
+  * por isso foi escolhido o tipo unsigned int (16 bits).
+  * Já o dado possui 8 bits, por isso foi escolhido o tipo unsigned char (8 bits).
+  */
+
+  add = add & 0x07FF; //protege os bits que nao se referem ao endereco
+  
+  unsigned int ms_add = 0xFF00; //mask p/ 8 MSB do endereco (8 primeiros bits)
+  unsigned int ls_add = 0x00FF; //mask p/ 8 LSB do endereco (8 ultimos bits)
+  
+  ms_add = ms_add & add; //captura 8 primeiros bits do endereco
+  ls_add = ls_add & add; //captura 8 ultimos bits do endereco
+  
+  ms_add = ms_add >> 8; // desloca 8 posicoes p/direita
+  ms_add = ms_add | 0x50; // 0101 0ms_add (ms_add preenche os ultimos 3 bits)
+
+  //figura 8 do manual p/ referência
+  //start 1010 aaa 0(W) ack aaaa aaaa ack dddd dddd ack stop
+  //a -> bits de endereco
+  //d -> bits de dado
+  
+  Wire.beginTransmission((byte)ms_add); //envia a parte inicial do endereco: 1010 aaa
+  Wire.write((byte)ls_add); //envia W e segunda parte do endereco (8 bits restantes)
+  Wire.write(dado); //envia 8 bits de dados
+  Wire.endTransmission();
+  _delay_ms(5);
+}
+
+unsigned char ler(unsigned int add) {
+  add = add & 0x07FF; //protege os bits que nao se referem ao endereco
+  unsigned int ms_add = 0xFF00; //mask p/ 8 MSB do endereco (8 primeiros bits)
+  unsigned int ls_add = 0x00FF; //mask p/ 8 LSB do endereco (8 ultimos bits)
+  
+  ms_add = ms_add & add; //captura 8 primeiros bits do endereco
+  ls_add = ls_add & add; //captura 8 ultimos bits do endereco
+  
+  ms_add = ms_add >> 8; // desloca 8 posicoes p/direita
+  ms_add = ms_add | 0x50; // 0101 0ms_add (ms_add preenche os ultimos 3 bits)
+
+  //figura 11 do manual p/referência
+  //start 1010 aaa 0(W) ack aaaa aaaa ack start 1010 aaa 1(R) ack dddd dddd no-ack stop
+  //a -> bits de endereco
+  //d -> bits de dado
+
+  Wire.beginTransmission((byte)ms_add); //envia a parte inicial do endereco: 1010 aaa
+  Wire.write((byte)ls_add); //envia W e segunda parte do endereco (8 bits restantes)
+  Wire.endTransmission();
+
+  Wire.requestFrom(ms_add, 1); //envia 1010 aaa R e "pede" 1 byte de dados como resposta
+  while(!Wire.available()); //há bytes disponiveis p/leitura?
+  valor = Wire.read(); //lê o byte disponível
+  return valor;
+}
+
+
+void le_temp(){
+  coleta_temp = false;
+  contador_coleta_temp = 0;
+  int read_val = analogRead(LM35);
+  temperatura += 0.10752688*read_val; // (1.1/1023)/10e-3 = 0.10752688
+  // temperatura agreda o valor das medidas para realizar a média posteriormente
+}
+
+//funcao que escreve temperatura no endereco adequado e atualiza o contador (ultimos 2 enderecos da memoria)
+void escreve_temp(unsigned int prox_endereco){
+  unsigned int ms_temp_mask = 0xFF00; //mask p/ 8 MSB do endereco (8 primeiros bits)
+  unsigned int ls_temp_mask = 0x00FF; //mask p/ 8 LSB do endereco (8 ultimos bits)
+  
+  unsigned int ms_temp = ms_temp_mask & temp; //captura 8 primeiros bits da temperatura
+  unsigned int ls_temp = ls_temp_mask & temp; //captura 8 ultimos bits da temperatura
+  ms_temp = ms_temp >> 8; // desloca 8 posicoes p/direita
+  
+  unsigned int ms_add_cont = ms_temp_mask & (prox_endereco/2+1); //captura 8 primeiros bits do endereco
+  unsigned int ls_add_cont = ls_temp_mask & (prox_endereco/2+1); //captura 8 ultimos bits do endereco
+  ms_add_cont = ms_add_cont >> 8; // desloca 8 posicoes p/direita
+
+  escrever(prox_endereco, ms_temp);
+  escrever(prox_endereco+1, ls_temp);
+  escrever(2046, ms_add_cont);
+  escrever(2047, ls_add_cont);
+}
+
+//funcao que trata o teclado matricial
+void tecla_mef() {
+  /*  teclado:
+   *  1   2   3
+   *  4   5   6
+   *  7   8   9
+   *  *   0   #
+   */
+
+  switch(estado_teclado){
+
+    case 1: //linha 1
+      digitalWrite(lin1, LOW);
+      digitalWrite(lin2, HIGH);
+      digitalWrite(lin3, HIGH);
+      digitalWrite(lin4, HIGH);
+      if (digitalRead(col1) == LOW || digitalRead(col2) == LOW || digitalRead(col3) == LOW) {
+        linha = 1;
+        estado_teclado = 5;
+      }
+      else estado_teclado = 2;
+      break;
+    
+    case 2: //linha 2
+      digitalWrite(lin1, HIGH);
+      digitalWrite(lin2, LOW);
+      digitalWrite(lin3, HIGH);
+      digitalWrite(lin4, HIGH);
+      if (digitalRead(col1) == LOW || digitalRead(col2) == LOW || digitalRead(col3) == LOW) {
+        linha = 2;
+        estado_teclado = 5;
+      }
+      else estado_teclado = 3;
+      break;
+
+    case 3: //linha 3
+      digitalWrite(lin1, HIGH);
+      digitalWrite(lin2, HIGH);
+      digitalWrite(lin3, LOW);
+      digitalWrite(lin4, HIGH);
+      if (digitalRead(col1) == LOW || digitalRead(col2) == LOW || digitalRead(col3) == LOW) {
+        linha = 3;
+        estado_teclado = 5;
+      }
+      else estado_teclado = 4;
+      break;
+
+    case 4: //linha 4
+      digitalWrite(lin1, HIGH);
+      digitalWrite(lin2, HIGH);
+      digitalWrite(lin3, HIGH);
+      digitalWrite(lin4, LOW);
+      if (digitalRead(col1) == LOW || digitalRead(col2) == LOW || digitalRead(col3) == LOW) {
+        linha = 4;
+        estado_teclado = 5;
+      }
+      else estado_teclado = 1;
+      break;
+
+    case 5: // Salva posição
+      if (linha == 1){
+        if (botao_pressionado){
+          if (digitalRead(col1) == HIGH && digitalRead(col2) == HIGH && digitalRead(col3) == HIGH){
+            estado_teclado = 6;
+            botao_solto = true;
+          }
+        }
+        else if (digitalRead(col1) == LOW && digitalRead(col2) == HIGH && digitalRead(col3) == HIGH) { //linha 1, coluna 1
+          posicao = 1;
+        }
+        else if (digitalRead(col1) == HIGH && digitalRead(col2) == LOW && digitalRead(col3) == HIGH) { //linha 1, coluna 2
+          posicao=2;
+        }
+        else if (digitalRead(col1) == HIGH && digitalRead(col2) == HIGH && digitalRead(col3) == LOW) { //linha 1, coluna 3
+          posicao=3;
+        }
+      }
+
+      else if (linha == 2){
+        if (botao_pressionado){
+          if (digitalRead(col1) == HIGH && digitalRead(col2) == HIGH && digitalRead(col3) == HIGH){
+            estado_teclado = 6;
+            botao_solto = true;
+          }
+        }
+        if (digitalRead(col1) == LOW && digitalRead(col2) == HIGH && digitalRead(col3) == HIGH) { //linha 2, coluna 1
+          posicao=4;
+        }
+        else if (digitalRead(col1) == HIGH && digitalRead(col2) == LOW && digitalRead(col3) == HIGH) { //linha 2, coluna 2
+          posicao=5;
+        }
+        else if (digitalRead(col1) == HIGH && digitalRead(col2) == HIGH && digitalRead(col3) == LOW) { //linha 2, coluna 3
+          posicao=6;
+        }
+      }
+
+      else if (linha == 3){
+        if (botao_pressionado){
+          if (digitalRead(col1) == HIGH && digitalRead(col2) == HIGH && digitalRead(col3) == HIGH){
+            estado_teclado = 6;
+            botao_solto = true;
+          }
+        }
+        if (digitalRead(col1) == LOW && digitalRead(col2) == HIGH && digitalRead(col3) == HIGH) { //linha 3, coluna 1
+          posicao=7;
+        }
+        else if (digitalRead(col1) == HIGH && digitalRead(col2) == LOW && digitalRead(col3) == HIGH) { //linha 3, coluna 2
+          posicao=8;
+        }
+        else if (digitalRead(col1) == HIGH && digitalRead(col2) == HIGH && digitalRead(col3) == LOW) { //linha 3, coluna 3
+          posicao=9;
+        }
+      }
+
+      else if (linha == 4){
+        if (botao_pressionado){
+          if (digitalRead(col1) == HIGH && digitalRead(col2) == HIGH && digitalRead(col3) == HIGH){
+            estado_teclado = 6;
+            botao_solto = true;
+          }
+        }
+        if (digitalRead(col1) == LOW && digitalRead(col2) == HIGH && digitalRead(col3) == HIGH) { //linha 4, coluna 1
+          posicao=10;
+        }
+        else if (digitalRead(col1) == HIGH && digitalRead(col2) == LOW && digitalRead(col3) == HIGH) { //linha 4, coluna 2
+          posicao=11;
+        }
+        else if (digitalRead(col1) == HIGH && digitalRead(col2) == HIGH && digitalRead(col3) == LOW) { //linha 4, coluna 3
+          posicao=12;
+        }
+      }
+
+      if (posicao == 0){ // Verifica click falso
+        estado_teclado = 1;
+      }
+      // Garante que avançe apenas no primeiro click ou na soltura do botão
+      else if ((!botao_solto && !botao_pressionado) || (botao_solto && botao_pressionado)) {
+        estado_teclado = 6;
+      }
+      break;
+
+    case 6: // Debounce
+      flag_deb = true; //ativa contador p/debounce
+      posicao_deb = posicao;
+      if (!botao_solto && !botao_pressionado && cnt_timer_deb >= intervalo_debounce/2) { //botao se manteve pressionado após intervalo de debouncing
+        flag_deb = false;
+        cnt_timer_deb = 0;
+        estado_teclado = 7;
+      }
+      else if (botao_solto && botao_pressionado && cnt_timer_deb >= intervalo_debounce/2){
+        posicao = 0;
+        posicao_deb = 0;
+        flag_deb = false;
+        botao_pressionado = false;
+        botao_solto = false;
+        cnt_timer_deb = 0;
+        estado_teclado = 1;
+        acao_botao = printa;
+      }
+      break;
+    
+    case 7: // Verifica ruido
+      if (posicao_deb == posicao){
+        estado_teclado = 8;
+      }
+      else { // Ruído
+        estado_teclado = 1;
+      }
+      posicao_deb = 0;
+      break;
+
+    case 8: // Salva click
+      botao_pressionado = true;
+      if (posicao <= 9){
+        printa = String(posicao);
+      }
+      else if (posicao == 11) {
+        printa = "0";
+      }
+      else if (posicao == 10){
+        printa = "*";
+      }
+      else if (posicao == 12){
+        printa = "#";
+      }
+      estado_teclado = 5;
+      break;
+  }
+}
+
+//funcao que trata display LCD
+void displayLCD_mef() {
+
+  switch (estado_displayLCD){
+
+    case 0: // Bem vindo
+      lcd.setCursor(0, 0); //coluna 0, linha 0
+      lcd.print("BEM-VINDO(A)    ");
+      lcd.setCursor(0, 1); //coluna 0, linha 1
+      lcd.print("ESCOLHA A FUNCAO");
+      estado_displayLCD = 1;
+      break;
+
+    case 1: // Verificar qual ação é desejada
+      if (acao_botao == "1"){
+        lcd.setCursor(0, 0);
+        lcd.print("1 - RESET       ");
+        lcd.setCursor(0, 1);
+        lcd.print("CONFIRMAR?      ");
+        acao = 1;
+        estado_displayLCD = 2;
+      }
+      else if (acao_botao == "2"){
+        lcd.setCursor(0, 0);
+        lcd.print("2 - STATUS      ");
+        lcd.setCursor(0, 1);
+        lcd.print("CONFIRMAR?      ");
+        acao = 2;
+        estado_displayLCD = 2;
+      }
+      else if (acao_botao == "3"){
+        lcd.setCursor(0, 0);
+        lcd.print("3 - START       ");
+        lcd.setCursor(0, 1);
+        lcd.print("CONFIRMAR?      ");
+        acao = 3;
+        estado_displayLCD = 2;
+      }
+      else if (acao_botao == "4"){
+        lcd.setCursor(0, 0);
+        lcd.print("4 - STOP        ");
+        lcd.setCursor(0, 1);
+        lcd.print("CONFIRMAR?      ");
+        acao = 4;
+        estado_displayLCD = 2;
+      }
+      else if (acao_botao == "5"){
+        lcd.setCursor(0, 0);
+        lcd.print("5 - TRANSF. DADO");
+        lcd.setCursor(0, 1);
+        lcd.print("CONFIRMAR?      ");
+        acao = 5;
+        estado_displayLCD = 2;
+      }
+      break;
+
+    case 2: // Confirmar ou negar operação
+      if (acao_botao == "*"){ //Cancela
+        acao = 0;
+        estado_displayLCD = 0;
+      }
+      else if (acao_botao == "#"){ //Confirma
+        estado_displayLCD = 3;
+      }
+      break;
+    
+    case 3: // Gerencia ação
+      if (acao == 1){
+        estado_displayLCD = 4; // Reset
+      }
+      else if (acao == 2){
+        estado_displayLCD = 5; // Status
+      }
+      else if (acao == 3){
+        estado_displayLCD = 6; // Start
+      }
+      else if (acao == 4){
+        estado_displayLCD = 7; // Stop
+      }
+      else if (acao == 5){
+        estado_displayLCD = 8; // Transfer
+      }
+      break;
+
+    case 4: // RESET
+      escrever(2046, 0);
+      escrever(2047, 0);
+      lcd.setCursor(0, 0);
+      lcd.print("RESET           ");
+      lcd.setCursor(0, 1);
+      lcd.print("LIMPANDO MEMORIA");
+      estado_displayLCD = 1;
+      break;
+
+    case 5: // STATUS
+      dados_disponiveis = 1023-n_dados_armazenados;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("GRAVADO: ");
+      lcd.print(n_dados_armazenados);
+      lcd.setCursor(0, 1);
+      lcd.print("DISPONIVEL: ");
+      lcd.print(dados_disponiveis);
+      estado_displayLCD = 1;
+      break;
+  
+    case 6: // START
+      lcd.setCursor(0, 0);
+      lcd.print("START           ");
+      lcd.setCursor(0, 1);
+      lcd.print("INICIO DA COLETA");
+      start_coleta = true;
+      estado_displayLCD = 1;
+      break;
+
+    case 7: // STOP
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("STOP: FIM");
+      lcd.setCursor(0, 1);
+      lcd.print("No DADOS: ");
+      lcd.print(n_dados_armazenados);
+      start_coleta = false;
+      estado_displayLCD = 1;
+      break;
+
+    case 8: // TRANSFER
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("TRANSF. DADOS");
+      lcd.setCursor(0, 1);
+      lcd.print("ESC. QTDE: ");
+      lcd.print(qtd);
+      acao_botao = "";
+      estado_displayLCD = 9;
+      break;
+
+    case 9: // SEL QTD TRANSFER
+      if(acao_botao != "" && acao_botao != "#" && qtd.length() < 5 && qtd.toInt() <= n_dados_armazenados){
+        qtd = qtd + acao_botao;
+        estado_displayLCD = 8;
+      }
+      else if (acao_botao == "#"){
+        estado_displayLCD = 10;
+      }
+      else if (qtd.toInt() > n_dados_armazenados){
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print(" OVERFLOW DADOS");
+        lcd.setCursor(0, 1);
+        lcd.print("--ESCOLHA ACAO--");
+        qtd = "";
+        estado_displayLCD = 1;
+      }
+      break;
+
+    case 10: // TRANSFER SERIAL
+      for (int i = 0; i < qtd.toInt(); i+=1){
+        Serial.println(float(ler(2*i)*256+ler(2*i+1))/10);
+      }
+      qtd = "";
+      estado_displayLCD = 1;
+      break;
+
+  }
+}
+
+void setup() {
+  // Inicializa serial
+  Serial.begin(9600);
+
+  // Inicializa I2C
+  Wire.begin();
+  
+  // Inicializa LCD
+  lcd.begin(16,2);
+
+  analogReference(INTERNAL); //Valor de referência é 1,1V
+
+  //pinos
+  pinMode(lin1, OUTPUT);
+  pinMode(lin2, OUTPUT);
+  pinMode(lin3, OUTPUT);
+  pinMode(lin4, OUTPUT);
+  pinMode(col1, INPUT_PULLUP);
+  pinMode(col2, INPUT_PULLUP);
+  pinMode(col3, INPUT_PULLUP);
+  pinMode(LM35, INPUT);
+
+  // Configura as interrupcoes
+  cli();  //desabilita interrupcoes
+  configuracao_Timer0();  //configura o temporizador
+  sei();  //habilita interrupcoes
+
+  n_dados_armazenados = (ler(2046)*256+ler(2047));
+}
+
+void loop() {
+  
+  tecla_mef(); //detecta botao pressionado
+  displayLCD_mef(); //dá o feedback visual para o usuário
+
+  if (coleta_temp){ //a cada 200ms a temperatura é lida e agregada em temperatura
+    le_temp();
+    contador_temperaturas++;
+    if (contador_temperaturas>=10){
+      att_temp = true;
+    }
+  }
+
+  if (att_temp) { //a cada 2 segundos atualiza temp
+    digitos_7seg();
+    if (start_coleta){ //Verifica se startou a coleta
+      prox_endereco = (ler(2046)*256+ler(2047))*2;
+      if (prox_endereco < 2046){ //Protege endereço do contador de coletas (2046 - msb, e 2047 - lsb)
+        escreve_temp(prox_endereco);
+        n_dados_armazenados = prox_endereco/2+1;
+      }
+      else {
+        start_coleta = false;
+      }
+    }
+  }
+
+  if (atualiza_display) { //flag: intervalo atingido -> atualizacao do display de 7seg
+    seleciona_envia_digito(digito); //atualiza um dígito a cada vez
+    digito++;
+    if(digito>=4)
+      digito=0;
+  }
+}
