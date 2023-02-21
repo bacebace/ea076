@@ -382,7 +382,7 @@ void tecla_mef() {
           posicao=9;
         }
       }
-
+      
       else if (linha == 4){
         if (botao_pressionado){
           if (digitalRead(col1) == HIGH && digitalRead(col2) == HIGH && digitalRead(col3) == HIGH){
